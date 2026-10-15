@@ -26,8 +26,8 @@ Use **Switch role** at the top to test both sides. Click the **Lakify** logo to 
 | File | What it contains |
 |---|---|
 | `index.html` | The page structure |
-| `style.css` | All the styling |
-| `app.js` | All the logic |
+| `lakify.css` | All the styling |
+| `lakify.js` | All the logic |
 
 Keep all three files in the same folder, with exactly these names.
 
@@ -46,7 +46,7 @@ Double-click `index.html` to open it in your browser.
 
 ## How the code is organised
 
-`app.js` is split into numbered sections:
+`lakify.js` is split into numbered sections:
 
 1. **Storage**: saving and loading data
 2. **Data**: listings, the tenant's saved flats and documents
@@ -68,17 +68,5 @@ Everything is saved in the browser's `localStorage`:
 
 ## Planned: Supabase
 
-The app will later use [Supabase](https://supabase.com) as its database. Only **section 1 (Storage)** in `app.js` needs to change. Its `get` and `set` functions will be replaced with Supabase calls, and the rest of the app stays the same.
+The app will later use [Supabase](https://supabase.com) as its database. Only **section 1 (Storage)** in `lakify.js` needs to change. Its `get` and `set` functions will be replaced with Supabase calls, and the rest of the app stays the same.
 
-## Troubleshooting
-
-**The page only shows a "Lakify" button.**
-The browser can't find `style.css` or `app.js`. Check that:
-- the file names are exactly `style.css` and `app.js`, not `app (1).js` or `app.js.txt`
-- all three files are in the same folder
-
-Press `F12` in Chrome and open the **Console** tab to see which file is missing.
-
-## About the name
-
-*Lakás* is Hungarian for flat. Using Pythagorean numerology, the letters of L-A-K-I-F-Y add up to 28 (3+1+2+9+6+7), the "wealth number" in GG33's teaching on money numbers.
