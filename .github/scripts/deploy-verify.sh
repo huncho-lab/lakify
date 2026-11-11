@@ -96,6 +96,18 @@ version_check() {
 
 rollout() { k rollout status "$1" --timeout="$2"; }
 
+# `rollout status` returns as soon as the new pods are ready, while pods of the
+# previous version may still be shutting down and briefly receive traffic.
+# settle <app name> <replicas> <seconds> waits until only the new pods remain.
+settle() {
+  for _ in $(seq 1 "$3"); do
+    [ "$(k get pods -l app.kubernetes.io/name="$1" --no-headers 2>/dev/null | wc -l)" -eq "$2" ] && return 0
+    sleep 1
+  done
+  echo "old $1 pods were still terminating after $3 s"
+  return 1
+}
+
 # wait_ready <deployment> <replicas> <seconds>
 wait_ready() {
   for _ in $(seq 1 "$3"); do
@@ -136,9 +148,11 @@ k annotate deployment/lakify-api deployment/lakify-web kubernetes.io/change-caus
 
 failure=""
 if ! rollout deployment/lakify-api "$ROLLOUT_TIMEOUT"; then
-  failure="api rollout did not become ready within $ROLLOUT_TIMEOUT"
+  failure="api rollout did not become ready (progress deadline or timeout)"
 elif ! rollout deployment/lakify-web "$ROLLOUT_TIMEOUT"; then
-  failure="web rollout did not become ready within $ROLLOUT_TIMEOUT"
+  failure="web rollout did not become ready (progress deadline or timeout)"
+elif ! settle lakify-api 2 60 || ! settle lakify-web 2 60; then
+  failure="previous pods did not terminate"
 elif ! version_check; then
   failure="new version does not report commit $EXPECTED_SHA"
 elif ! smoke_test candidate; then
@@ -158,6 +172,8 @@ if [ -n "$failure" ]; then
   rollback_ok=true
   rollout deployment/lakify-api 180s || rollback_ok=false
   rollout deployment/lakify-web 180s || rollback_ok=false
+  settle lakify-api 2 60 || rollback_ok=false
+  settle lakify-web 2 60 || rollback_ok=false
   if $rollback_ok && smoke_test after-rollback; then
     t_recovered=$(now)
   else
