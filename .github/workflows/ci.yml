@@ -3,12 +3,14 @@
 # Every push and pull request to main runs two jobs:
 #   1. test  - lint, unit/integration tests and the 80 % coverage gate
 #   2. build - build the Docker image, start it, wait for the HEALTHCHECK
-#              and smoke-test the live endpoints
+#              and smoke-test the live endpoints, then deploy it to a
+#              throwaway Kubernetes (Kind) cluster with the k8s/ manifests
+#              and test the rollout, Service, self-healing and a rolling update
 # The build job only runs when tests pass, so a broken commit never
 # produces an image.
 #
-# On pushes to main (not pull requests), the image that passed the smoke
-# tests is then pushed to GitHub Container Registry as
+# On pushes to main (not pull requests), the image that passed all of the
+# above is then pushed to GitHub Container Registry as
 #   ghcr.io/<owner>/lakify-api:sha-<commit>  (immutable, one per commit)
 #   ghcr.io/<owner>/lakify-api:latest        (moves to the newest main build)
 # Pushing the tested image itself, rather than rebuilding, guarantees the
@@ -21,11 +23,13 @@ on:
     branches: [main]
     paths:
       - 'api/**'
+      - 'k8s/**'
       - '.github/workflows/ci.yml'
   pull_request:
     branches: [main]
     paths:
       - 'api/**'
+      - 'k8s/**'
       - '.github/workflows/ci.yml'
   workflow_dispatch: # allows a manual run from the Actions tab
 
@@ -81,7 +85,7 @@ jobs:
     name: Build and smoke-test image
     needs: test
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     # packages: write lets this job push to GHCR with the built-in token.
     # Pull requests never reach the push steps (see PUBLISH below).
@@ -181,6 +185,93 @@ jobs:
       - name: Show container logs on failure
         if: failure()
         run: docker logs lakify || true
+
+      # ---- Kubernetes (Kind) ------------------------------------------------
+
+      - name: Create Kind cluster
+        uses: helm/kind-action@v1.15.2
+        with:
+          cluster_name: lakify
+          wait: 120s
+
+      - name: Load the tested image into the cluster
+        run: |
+          docker tag "$IMAGE" lakify-api:ci
+          kind load docker-image lakify-api:ci --name lakify
+
+      - name: Deploy manifests and wait for the rollout
+        working-directory: k8s
+        run: |
+          kubectl kustomize overlays/kind
+          kubectl apply -k overlays/kind
+          kubectl -n lakify rollout status deployment/lakify-api --timeout=120s
+          kubectl -n lakify get deploy,rs,pods,svc -o wide
+
+      - name: Check pod security settings
+        run: |
+          set -euo pipefail
+          pod=$(kubectl -n lakify get pod -l app.kubernetes.io/name=lakify-api -o jsonpath='{.items[0].metadata.name}')
+          test "$(kubectl -n lakify exec "$pod" -- id -u)" = "1000"
+          # The root filesystem must be mounted read-only
+          kubectl -n lakify exec "$pod" -- cat /proc/mounts | awk '$2=="/"{print $4}' | grep -q '^ro'
+          # and /tmp (the emptyDir) must still be writable
+          kubectl -n lakify exec "$pod" -- touch /tmp/ok
+          echo "Pod runs as uid 1000 with a read-only root filesystem"
+
+      - name: Smoke-test through the Kubernetes Service
+        run: |
+          set -euo pipefail
+          kubectl -n lakify port-forward svc/lakify-api 8080:80 > /tmp/port-forward.log 2>&1 &
+          pf=$!
+          for i in $(seq 1 30); do curl -fsS localhost:8080/health && break; sleep 1; done
+          echo
+
+          base=http://localhost:8080
+          curl -fsS "$base/ready" | grep -q '"status":"ready"'
+          curl -fsS "$base/version" | grep -q "\"commit\":\"${GITHUB_SHA::7}\""
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$base/api/listings" \
+            -H 'Content-Type: application/json' \
+            -d '{"title":"K8s flat","address":"Andrássy út 1","district":"VI","rent":300000,"size":50,"rooms":2,"photos":["https://example.com/k.jpg"]}')" = "201"
+          curl -fsS "$base/api/listings" | grep -q '"title":"K8s flat"'
+          kill "$pf"
+          echo "Service smoke tests passed"
+
+      - name: Self-healing - delete the pod and wait for Kubernetes to replace it
+        run: |
+          set -euo pipefail
+          old=$(kubectl -n lakify get pod -l app.kubernetes.io/name=lakify-api -o jsonpath='{.items[0].metadata.name}')
+          start=$(date +%s)
+          kubectl -n lakify delete pod "$old" --wait=false
+          for i in $(seq 1 60); do
+            new=$(kubectl -n lakify get pod -l app.kubernetes.io/name=lakify-api \
+              -o jsonpath='{range .items[?(@.status.containerStatuses[0].ready==true)]}{.metadata.name}{"\n"}{end}' | grep -v "^$old$" || true)
+            if [ -n "$new" ]; then
+              echo "Replacement pod $new ready after $(( $(date +%s) - start ))s" | tee -a "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::No replacement pod became ready"; exit 1
+
+      # maxUnavailable: 0 means the old pod is only removed once the new one
+      # passes its readiness probe.
+      - name: Rolling update
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          kubectl -n lakify rollout restart deployment/lakify-api
+          kubectl -n lakify rollout status deployment/lakify-api --timeout=120s
+          echo "Rolling update finished in $(( $(date +%s) - start ))s" | tee -a "$GITHUB_STEP_SUMMARY"
+          kubectl -n lakify rollout history deployment/lakify-api
+
+      - name: Show Kubernetes diagnostics on failure
+        if: failure()
+        run: |
+          kubectl -n lakify get all -o wide || true
+          kubectl -n lakify describe deployment lakify-api || true
+          kubectl -n lakify describe pods -l app.kubernetes.io/name=lakify-api || true
+          kubectl -n lakify logs -l app.kubernetes.io/name=lakify-api --all-containers --tail=100 || true
+          kubectl -n lakify get events --sort-by=.lastTimestamp || true
 
       # ---- Publish (main only) -------------------------------------------
 

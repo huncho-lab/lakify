@@ -1,0 +1,14 @@
+# Overlay used by CI to deploy into a throwaway Kind cluster.
+# CI tags the image it just built as lakify-api:ci and loads it straight into
+# the cluster with `kind load`, so nothing is pulled from a registry and the
+# exact tested image is what runs.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+images:
+  - name: ghcr.io/huncho-lab/lakify-api
+    newName: lakify-api
+    newTag: ci

@@ -1,0 +1,93 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lakify-api
+spec:
+  # One replica for now: listings are kept in memory, so several pods would
+  # each hold different data. Scale up once the store moves to Supabase.
+  replicas: 1
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: lakify-api
+  # Zero-downtime rollouts: start the new pod and wait until it is ready
+  # before the old one is removed.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: lakify-api
+    spec:
+      # Matches the 10 s shutdown budget in server.js plus the preStop pause.
+      terminationGracePeriodSeconds: 30
+      automountServiceAccountToken: false # the app never talks to the Kubernetes API
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000 # the image's `node` user
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: api
+          image: ghcr.io/huncho-lab/lakify-api:latest # overlays pin this to a commit tag
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            - name: PORT
+              value: "3000"
+            - name: NODE_ENV
+              value: production
+          # Startup: give Node up to 30 s to boot before liveness checks begin.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 2
+            failureThreshold: 15
+          # Liveness: restart the container if the process stops answering.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          # Readiness: only send traffic once the app says it is ready.
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 2
+            failureThreshold: 2
+          # Give the Service a moment to stop routing to this pod before
+          # SIGTERM triggers the graceful shutdown in server.js.
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "5"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 192Mi # request bodies may be up to 5 MB of photo data
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp # writable scratch space, since the root filesystem is read-only
+          emptyDir:
+            sizeLimit: 16Mi
