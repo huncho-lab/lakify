@@ -1,0 +1,31 @@
+# Prometheus configuration: scrape every lakify-api pod's /metrics every
+# 15 s. Pods are found through the Kubernetes API (pod discovery), so
+# each replica is scraped separately and new pods are picked up
+# automatically after a rollout.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: lakify-api
+    metrics_path: /metrics
+    kubernetes_sd_configs:
+      - role: pod
+        namespaces:
+          names: [lakify]
+    relabel_configs:
+      # Keep only the API pods' "http" port.
+      - source_labels: [__meta_kubernetes_pod_label_app_kubernetes_io_name]
+        regex: lakify-api
+        action: keep
+      - source_labels: [__meta_kubernetes_pod_container_port_name]
+        regex: http
+        action: keep
+      - source_labels: [__meta_kubernetes_pod_name]
+        target_label: pod
+      - source_labels: [__meta_kubernetes_pod_label_pod_template_hash]
+        target_label: revision
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

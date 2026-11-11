@@ -4,7 +4,7 @@ A demo web app for finding rental flats in Budapest, with a Tinder-style swipe i
 
 Tenants swipe through flats and save the ones they like. Landlords list their flats with photos and proof of ownership.
 
-> This is a demo, not a production app. All data is saved in your own browser.
+> This is a demo, not a production app.
 
 ## Features
 
@@ -21,34 +21,33 @@ Tenants swipe through flats and save the ones they like. Landlords list their fl
 
 Use **Switch role** at the top to test both sides. Click the **Lakify** logo to go back to the start screen.
 
-## Project files
+## Project structure
 
-| File | What it contains |
+| Folder | What it contains |
 |---|---|
-| `index.html` | The page structure |
-| `lakify.css` | All the styling |
-| `lakify.js` | All the logic |
+| `web/` | The front end (`lakify.html`, `lakify.css`, `lakify.js`) and the nginx image that serves it |
+| `api/` | The REST API (Node.js + Express) that stores listings in PostgreSQL, with tests and its Dockerfile |
+| `k8s/` | Kubernetes manifests: front end, API, PostgreSQL, Prometheus and Grafana |
+| `.github/` | The CI/CD pipeline (GitHub Actions) and its deploy-and-rollback script |
 
-Keep all three files in the same folder, with exactly these names.
+## How the data is stored
+
+- **Listings** are shared between landlords and tenants, so they are saved through the API in a **PostgreSQL** database.
+- **Your role, saved and skipped flats, and your documents** stay in your own browser (`localStorage`).
 
 ## How to run
 
-**With VS Code (recommended)**
-1. Open the project folder in VS Code (**File → Open Folder**).
-2. Install the **Live Server** extension by Ritwick Dey.
-3. Right-click `index.html` and choose **Open with Live Server**.
+**Front end and API on your computer (VS Code)**
+1. Start the API: open a terminal, run `cd api`, `npm install` (first time only) and `npm run dev`. Without a database it keeps listings in memory.
+2. Install the **Live Server** extension by Ritwick Dey, right-click `web/lakify.html` and choose **Open with Live Server**. The page talks to the API on `localhost:3000`.
 
-The app opens in your browser and reloads every time you save a file.
-
-**Without VS Code**
-
-Double-click `index.html` to open it in your browser.
+**The whole system on Kubernetes** (front end, API, PostgreSQL and monitoring): see [`k8s/README.md`](k8s/README.md).
 
 ## How the code is organised
 
-`lakify.js` is split into numbered sections:
+`web/lakify.js` is split into numbered sections:
 
-1. **Storage**: saving and loading data
+1. **Storage**: talking to the API, and saving personal data in the browser
 2. **Data**: listings, the tenant's saved flats and documents
 3. **Helpers**: small utility functions
 4. **Navigation**: switching screens and tabs
@@ -59,14 +58,6 @@ Double-click `index.html` to open it in your browser.
 9. **Landlord: My flats**
 10. **Landlord: Add flat**
 
-## Data storage
+## CI/CD
 
-Everything is saved in the browser's `localStorage`:
-- Data stays after a page reload, but only in that browser.
-- Photos are resized before saving, and PDFs must be under 1 MB.
-- To start fresh, clear the site data in your browser.
-
-## Planned: Supabase
-
-The app will later use [Supabase](https://supabase.com) as its database. Only **section 1 (Storage)** in `lakify.js` needs to change. Its `get` and `set` functions will be replaced with Supabase calls, and the rest of the app stays the same.
-
+Every change goes through the GitHub Actions pipeline in `.github/workflows/ci.yml`: linting and tests on every push and pull request, then (on `main`) container images, deployment to a temporary Kubernetes cluster, verification, and automatic rollback if the new version is unhealthy.

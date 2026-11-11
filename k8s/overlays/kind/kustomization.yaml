@@ -1,14 +1,13 @@
-# Overlay used by CI to deploy into a throwaway Kind cluster.
-# CI tags the image it just built as lakify-api:ci and loads it straight into
-# the cluster with `kind load`, so nothing is pulled from a registry and the
-# exact tested image is what runs.
+# Overlay used by the pipeline's throwaway Kind cluster.
+#
+# The pipeline loads the images it pulled from GHCR straight into the Kind
+# nodes (`kind load docker-image`), so the cluster needs no registry
+# credentials. It first deploys the last known-good version (tag "stable",
+# set in the base) and then rolls out the new commit's images with
+# `kubectl set image`, which gives Kubernetes a previous revision to roll
+# back to (see .github/scripts/deploy-verify.sh).
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
 resources:
   - ../../base
-
-images:
-  - name: ghcr.io/huncho-lab/lakify-api
-    newName: lakify-api
-    newTag: ci

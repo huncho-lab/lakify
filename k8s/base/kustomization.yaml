@@ -6,14 +6,41 @@ namespace: lakify
 labels:
   - pairs:
       app.kubernetes.io/part-of: lakify
-      app.kubernetes.io/component: api
     includeSelectors: false
 
 resources:
   - namespace.yaml
-  - deployment.yaml
-  - service.yaml
+  - db/statefulset.yaml
+  - db/service.yaml
+  - api/configmap.yaml
+  - api/deployment.yaml
+  - api/service.yaml
+  - web/deployment.yaml
+  - web/service.yaml
+  - monitoring/prometheus.yaml
+  - monitoring/grafana.yaml
 
+# The database's first-start script and Grafana's provisioning files are
+# kept as plain files and turned into ConfigMaps here. The generated names
+# carry a content hash, so editing a file rolls the pods that use it.
+configMapGenerator:
+  - name: lakify-db-init
+    files:
+      - db/schema.sql
+  - name: prometheus-config
+    files:
+      - monitoring/prometheus.yml
+  - name: grafana-provisioning
+    files:
+      - datasources.yaml=monitoring/grafana-datasources.yaml
+      - dashboards.yaml=monitoring/grafana-dashboards.yaml
+  - name: grafana-dashboard-lakify
+    files:
+      - lakify-api.json=monitoring/dashboard-lakify-api.json
+
+# Overlays pin these to a specific version.
 images:
   - name: ghcr.io/huncho-lab/lakify-api
-    newTag: latest
+    newTag: stable
+  - name: ghcr.io/huncho-lab/lakify-web
+    newTag: stable

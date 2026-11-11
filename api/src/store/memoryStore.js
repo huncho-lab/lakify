@@ -1,31 +1,32 @@
 const { randomUUID } = require('node:crypto');
 
 /**
- * In-memory listing store. It mirrors the "STORAGE" section of the Lakify
- * frontend and is the single place to swap for Supabase later: any
- * replacement only has to implement these five methods.
+ * In-memory listing store, used by the automated tests and for local
+ * development without a database. It has exactly the same async interface
+ * as the PostgreSQL store (postgresStore.js), so the routes cannot tell
+ * which one they are talking to.
  */
-function createListingStore() {
+function createMemoryStore() {
   const listings = new Map();
 
   return {
-    list() {
-      // Newest first, like the frontend (listings.unshift).
+    async list() {
+      // Newest first, like the PostgreSQL store (ORDER BY created_at DESC).
       return Array.from(listings.values()).reverse();
     },
 
-    get(id) {
+    async get(id) {
       return listings.get(id) || null;
     },
 
-    create(data) {
+    async create(data) {
       const now = new Date().toISOString();
       const listing = { id: randomUUID(), ...data, createdAt: now, updatedAt: now };
       listings.set(listing.id, listing);
       return listing;
     },
 
-    update(id, changes) {
+    async update(id, changes) {
       const existing = listings.get(id);
       if (!existing) return null;
       const updated = { ...existing, ...changes, updatedAt: new Date().toISOString() };
@@ -33,10 +34,15 @@ function createListingStore() {
       return updated;
     },
 
-    remove(id) {
+    async remove(id) {
       return listings.delete(id);
     },
+
+    // Readiness check: an in-memory store is always reachable.
+    async ping() {},
+
+    async close() {},
   };
 }
 
-module.exports = createListingStore;
+module.exports = createMemoryStore;

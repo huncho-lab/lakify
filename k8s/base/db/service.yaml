@@ -1,0 +1,17 @@
+# Headless Service: gives the StatefulSet's pod the stable DNS name
+# lakify-db, which the API uses as PGHOST.
+apiVersion: v1
+kind: Service
+metadata:
+  name: lakify-db
+  labels:
+    app.kubernetes.io/name: lakify-db
+    app.kubernetes.io/component: database
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: lakify-db
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres

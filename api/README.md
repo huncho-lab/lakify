@@ -10,8 +10,9 @@ the pipeline can build, test, containerise and deploy. It is written the way a c
 should be: health and readiness probes for Kubernetes, build metadata injected by CI, graceful
 shutdown on `SIGTERM`, JSON-only errors, and automated tests with an enforced coverage threshold.
 
-Data is held in memory for now. `src/store/listingStore.js` is the single place to swap for
-Supabase later.
+Listings are stored in PostgreSQL (`src/store/postgresStore.js`) when `PGHOST` is set, as it is in
+the Kubernetes cluster. Without it, the API falls back to an in-memory store
+(`src/store/memoryStore.js`), which the automated tests also use. Both stores have the same interface.
 
 ## Requirements
 
@@ -42,6 +43,8 @@ npm run dev        # http://localhost:3000/health
 | ------------- | --------- | ----------------------------------------------- |
 | `PORT`        | `3000`    | Port to listen on                               |
 | `CORS_ORIGIN` | `*`       | Origin allowed to call the API (the frontend)   |
+| `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD` | unset | PostgreSQL connection; set by Kubernetes from a ConfigMap and a Secret |
+| `FAULT_MODE`  | unset     | `unready` or `error`: deliberately breaks the API for the pipeline's failure experiments |
 | `APP_VERSION` | `dev`     | Version reported by `/version` (set by CI)      |
 | `GIT_SHA`     | `unknown` | Commit reported by `/version` (set by CI)       |
 
@@ -52,7 +55,8 @@ npm run dev        # http://localhost:3000/health
 | Method | Path       | Description                               |
 | ------ | ---------- | ----------------------------------------- |
 | GET    | `/health`  | Liveness probe → `{ "status": "ok" }`     |
-| GET    | `/ready`   | Readiness probe → `{ "status": "ready" }` |
+| GET    | `/ready`   | Readiness probe: 200 when the database is reachable, otherwise 503 |
+| GET    | `/metrics` | Prometheus metrics: requests, errors and latency per route, plus Node.js process metrics |
 | GET    | `/version` | Build version and commit SHA              |
 
 ### Listings
@@ -103,7 +107,9 @@ src/
   server.js              # starts the server, handles graceful shutdown
   validation.js          # listing and filter validation
   routes/listings.js     # /api/listings routes
-  store/listingStore.js  # in-memory store (swap for Supabase later)
+  store/postgresStore.js # PostgreSQL store (used in the cluster)
+  store/memoryStore.js   # in-memory store (tests and local development)
+  metrics.js             # Prometheus metrics middleware and /metrics
   middleware/cors.js     # lets the frontend call the API
   middleware/errors.js   # 404 + central error handler
 tests/                   # Jest + Supertest tests

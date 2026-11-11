@@ -1,54 +1,52 @@
-# CI pipeline for the Lakify API.
+# CI/CD pipeline for Lakify (thesis Chapter 3, Figure 3.2).
 #
-# Every push and pull request to main runs two jobs:
-#   1. test  - lint, unit/integration tests and the 80 % coverage gate
-#   2. build - build the Docker image, start it, wait for the HEALTHCHECK
-#              and smoke-test the live endpoints, then deploy it to a
-#              throwaway Kubernetes (Kind) cluster with the k8s/ manifests
-#              and test the rollout, Service, self-healing and a rolling update
-# The build job only runs when tests pass, so a broken commit never
-# produces an image.
+#   1. ci      every push and pull request: lint the front end, lint and test
+#              the API. A failure stops the pipeline before any image is built.
+#   2. build   main only: build the API and front-end images, check them in
+#              Docker, and publish them to GHCR tagged with the commit.
+#   3. deploy  main only: create a Kind cluster, deploy the last known-good
+#              version ("stable") with PostgreSQL, Prometheus and Grafana, roll
+#              out the new version, verify it, roll back automatically if it
+#              fails, and tag it as the new "stable" if it passes.
 #
-# On pushes to main (not pull requests), the image that passed all of the
-# above is then pushed to GitHub Container Registry as
-#   ghcr.io/<owner>/lakify-api:sha-<commit>  (immutable, one per commit)
-#   ghcr.io/<owner>/lakify-api:latest        (moves to the newest main build)
-# Pushing the tested image itself, rather than rebuilding, guarantees the
-# registry holds exactly what was tested.
+# Pull requests run only job 1, so they are tested but never deployed.
+# A manual run (Actions -> CI -> Run workflow) can inject a fault into the new
+# version to measure detection and recovery (Chapter 5).
 
-name: CI
+name: CI/CD
 
 on:
   push:
     branches: [main]
-    paths:
-      - 'api/**'
-      - 'k8s/**'
-      - '.github/workflows/ci.yml'
+    paths: ['api/**', 'web/**', 'k8s/**', '.github/**']
   pull_request:
     branches: [main]
-    paths:
-      - 'api/**'
-      - 'k8s/**'
-      - '.github/workflows/ci.yml'
-  workflow_dispatch: # allows a manual run from the Actions tab
+    paths: ['api/**', 'web/**', 'k8s/**', '.github/**']
+  workflow_dispatch:
+    inputs:
+      fault:
+        description: Fault to inject into the new version (evaluation experiments)
+        type: choice
+        options: [none, unready, error]
+        default: none
 
-# A newer push to the same branch cancels the run that is still going.
+# One run per branch at a time. Pull request runs are replaced by newer
+# pushes; runs on main queue instead, so a deployment is never cut off halfway.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  group: cicd-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# Least privilege: the workflow only needs to read the repository.
+# Least privilege: jobs that need more ask for it themselves.
 permissions:
   contents: read
 
-defaults:
-  run:
-    working-directory: api
+env:
+  REGISTRY: ghcr.io/${{ github.repository_owner }}
 
 jobs:
-  test:
-    name: Lint and test
+  # ---------------------------------------------------------------------------
+  ci:
+    name: 1. Lint and test
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -63,13 +61,27 @@ jobs:
           cache: npm
           cache-dependency-path: api/package-lock.json
 
-      - name: Install dependencies
+      # Front end (FR2): HTML structure, CSS correctness, JavaScript syntax.
+      - name: Lint front-end HTML
+        run: npx --yes htmlhint@1.9.2 --config web/.htmlhintrc web/lakify.html
+
+      - name: Lint front-end CSS
+        run: npx --yes stylelint@18.0.0 --config web/.stylelintrc.json "web/**/*.css"
+
+      - name: Check front-end JavaScript syntax
+        run: node --check web/lakify.js
+
+      # API (FR3).
+      - name: Install API dependencies
+        working-directory: api
         run: npm ci
 
-      - name: Lint
+      - name: Lint API
+        working-directory: api
         run: npx eslint . --max-warnings 0
 
-      - name: Test with coverage gate (80 %)
+      - name: Test API with coverage gate (80 %)
+        working-directory: api
         run: npm run test:coverage -- --ci
 
       - name: Upload coverage report
@@ -81,112 +93,190 @@ jobs:
           retention-days: 14
           if-no-files-found: ignore
 
+  # ---------------------------------------------------------------------------
   build:
-    name: Build and smoke-test image
-    needs: test
+    name: 2. Build and publish images
+    needs: ci
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-
-    # packages: write lets this job push to GHCR with the built-in token.
-    # Pull requests never reach the push steps (see PUBLISH below).
+    timeout-minutes: 15
     permissions:
       contents: read
-      packages: write
+      packages: write # push images to GHCR with the built-in token
 
-    env:
-      IMAGE: lakify-api:ci-${{ github.sha }}
-      REGISTRY_IMAGE: ghcr.io/${{ github.repository_owner }}/lakify-api
-      PUBLISH: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      short_sha: ${{ steps.meta.outputs.short_sha }}
 
     steps:
       - name: Check out code
         uses: actions/checkout@v7
 
-      - name: Read version from package.json
+      - name: Work out version and tags
         id: meta
         run: |
-          echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
-          echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          short_sha="${GITHUB_SHA::7}"
+          echo "short_sha=$short_sha" >> "$GITHUB_OUTPUT"
+          echo "tag=sha-$short_sha" >> "$GITHUB_OUTPUT"
+          echo "version=$(node -p "require('./api/package.json').version")" >> "$GITHUB_OUTPUT"
+          echo "registry=${REGISTRY,,}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      - name: Build image
+      - name: Build API image
         uses: docker/build-push-action@v7
         with:
           context: api
-          load: true # keep the image in the runner's Docker so it can be run
-          push: false # the tested image is pushed by a later step on main
-          tags: ${{ env.IMAGE }}
-          # Links the GHCR package to this repository.
-          labels: |
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          load: true
+          push: false # pushed below, only after the checks pass
+          tags: ${{ steps.meta.outputs.registry }}/lakify-api:${{ steps.meta.outputs.tag }}
+          labels: org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
           build-args: |
             APP_VERSION=${{ steps.meta.outputs.version }}
             GIT_SHA=${{ steps.meta.outputs.short_sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,scope=api,mode=max
 
-      - name: Report image size
-        run: |
-          docker image ls "$IMAGE" --format 'Image size: {{.Size}}' | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: Build front-end image
+        uses: docker/build-push-action@v7
+        with:
+          context: web
+          load: true
+          push: false
+          tags: ${{ steps.meta.outputs.registry }}/lakify-web:${{ steps.meta.outputs.tag }}
+          labels: org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          build-args: |
+            APP_VERSION=${{ steps.meta.outputs.version }}
+            GIT_SHA=${{ steps.meta.outputs.short_sha }}
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,scope=web,mode=max
 
-      - name: Start container
-        run: docker run -d --name lakify -p 3000:3000 "$IMAGE"
-
-      - name: Wait for HEALTHCHECK to report healthy
-        run: |
-          for i in $(seq 1 30); do
-            status=$(docker inspect --format '{{.State.Health.Status}}' lakify)
-            echo "Attempt $i: $status"
-            if [ "$status" = "healthy" ]; then exit 0; fi
-            if [ "$status" = "unhealthy" ]; then break; fi
-            sleep 2
-          done
-          echo "::error::Container did not become healthy"
-          docker logs lakify
-          exit 1
-
-      - name: Smoke-test endpoints
+      - name: Report image sizes
         env:
-          EXPECTED_VERSION: ${{ steps.meta.outputs.version }}
-          EXPECTED_SHA: ${{ steps.meta.outputs.short_sha }}
+          REG: ${{ steps.meta.outputs.registry }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          {
+            echo "### Images"
+            echo ""
+            echo "| Image | Size |"
+            echo "|---|---|"
+            for name in lakify-api lakify-web; do
+              echo "| \`$REG/$name:$TAG\` | $(docker image ls "$REG/$name:$TAG" --format '{{.Size}}') |"
+            done
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      # Quick container checks before anything is published: both images
+      # start, report healthy, run as non-root, and nginx forwards /api/ to
+      # the API (here the API uses its in-memory store; PostgreSQL is tested
+      # in the deploy job).
+      - name: Start both containers on a test network
+        env:
+          REG: ${{ steps.meta.outputs.registry }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          docker network create lakify-ci
+          docker run -d --name api --network lakify-ci "$REG/lakify-api:$TAG"
+          docker run -d --name web --network lakify-ci -p 8080:8080 -e API_UPSTREAM=api:3000 "$REG/lakify-web:$TAG"
+
+      - name: Wait for both HEALTHCHECKs to report healthy
+        run: |
+          for c in api web; do
+            for i in $(seq 1 30); do
+              status=$(docker inspect --format '{{.State.Health.Status}}' "$c")
+              [ "$status" = healthy ] && { echo "$c healthy after $i checks"; break; }
+              [ "$status" = unhealthy ] && break
+              sleep 2
+            done
+            [ "$status" = healthy ] || { echo "::error::$c did not become healthy"; docker logs "$c"; exit 1; }
+          done
+
+      - name: Smoke-test the containers
+        env:
+          SHORT_SHA: ${{ steps.meta.outputs.short_sha }}
         run: |
           set -euo pipefail
-          base=http://localhost:3000
-
-          curl -fsS "$base/health" | grep -q '"status":"ok"'
-          curl -fsS "$base/ready"  | grep -q '"status":"ready"'
-
-          version=$(curl -fsS "$base/version")
-          echo "/version -> $version"
-          echo "$version" | grep -q "\"version\":\"$EXPECTED_VERSION\""
-          echo "$version" | grep -q "\"commit\":\"$EXPECTED_SHA\""
-
-          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$base/api/listings" \
-            -H 'Content-Type: application/json' \
-            -d '{"title":"CI flat","address":"Király utca 20","district":"VI","rent":250000,"size":45,"rooms":2,"photos":["https://example.com/a.jpg"]}')
-          test "$code" = "201"
-
-          curl -fsS "$base/api/listings" | grep -q '"title":"CI flat"'
-          test "$(curl -s -o /dev/null -w '%{http_code}' "$base/api/listings?district=XXX")" = "400"
-
-          echo "All smoke tests passed"
-
-      - name: Check the container runs as a non-root user
-        run: test "$(docker exec lakify id -u)" != "0"
+          curl -fsS localhost:8080/ | grep -q "<title>Lakify</title>"
+          curl -fsS localhost:8080/api/listings | grep -q '^\['
+          docker exec api node -e "fetch('http://127.0.0.1:3000/version').then(r=>r.json()).then(v=>{console.log(v);process.exit(v.commit==='$SHORT_SHA'?0:1)})"
+          test "$(docker exec api id -u)" != "0"
+          test "$(docker exec web id -u)" != "0"
+          echo "Container smoke tests passed"
 
       - name: Check graceful shutdown
         run: |
-          docker stop --time 10 lakify
-          test "$(docker inspect --format '{{.State.ExitCode}}' lakify)" = "0"
-          docker logs lakify 2>&1 | grep -q "SIGTERM received"
+          docker stop --time 10 api
+          test "$(docker inspect --format '{{.State.ExitCode}}' api)" = "0"
+          docker logs api 2>&1 | grep -q "SIGTERM received"
 
       - name: Show container logs on failure
         if: failure()
-        run: docker logs lakify || true
+        run: docker logs api; docker logs web
 
-      # ---- Kubernetes (Kind) ------------------------------------------------
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # FR6 / NFR3: one immutable tag per commit, so every deployed version
+      # can be traced to the code it was built from.
+      - name: Publish images tagged with the commit
+        env:
+          REG: ${{ steps.meta.outputs.registry }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          for name in lakify-api lakify-web; do
+            docker push "$REG/$name:$TAG"
+          done
+
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: 3. Deploy, verify and roll back
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      packages: write # pull the images and move the "stable" tag
+
+    env:
+      TAG: ${{ needs.build.outputs.tag }}
+      SHORT_SHA: ${{ needs.build.outputs.short_sha }}
+      FAULT_MODE: ${{ github.event.inputs.fault || 'none' }}
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull the new version and the last stable version
+        id: images
+        run: |
+          reg="${REGISTRY,,}"
+          echo "reg=$reg" >> "$GITHUB_OUTPUT"
+          for name in lakify-api lakify-web; do
+            docker pull "$reg/$name:$TAG"
+          done
+          # On the very first run there is no stable version yet; the new
+          # version then also serves as the baseline it is rolled out over.
+          if docker pull "$reg/lakify-api:stable" && docker pull "$reg/lakify-web:stable"; then
+            echo "first_run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::No stable version yet (first deployment); using the new version as the baseline"
+            echo "first_run=true" >> "$GITHUB_OUTPUT"
+            for name in lakify-api lakify-web; do
+              docker tag "$reg/$name:$TAG" "$reg/$name:stable"
+            done
+          fi
 
       - name: Create Kind cluster
         uses: helm/kind-action@v1.15.2
@@ -194,119 +284,59 @@ jobs:
           cluster_name: lakify
           wait: 120s
 
-      - name: Load the tested image into the cluster
+      - name: Load images into the cluster
+        env:
+          REG: ${{ steps.images.outputs.reg }}
         run: |
-          docker tag "$IMAGE" lakify-api:ci
-          kind load docker-image lakify-api:ci --name lakify
+          kind load docker-image --name lakify \
+            "$REG/lakify-api:$TAG" "$REG/lakify-web:$TAG" \
+            "$REG/lakify-api:stable" "$REG/lakify-web:stable"
 
-      - name: Deploy manifests and wait for the rollout
-        working-directory: k8s
+      # NFR6: the database password is a GitHub Actions secret (DB_PASSWORD),
+      # passed to the cluster as a Kubernetes Secret. If the secret is not
+      # configured, a random one-off password is used for this run's cluster.
+      - name: Create Kubernetes Secrets
+        env:
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
         run: |
-          kubectl kustomize overlays/kind
-          kubectl apply -k overlays/kind
-          kubectl -n lakify rollout status deployment/lakify-api --timeout=120s
-          kubectl -n lakify get deploy,rs,pods,svc -o wide
+          password="${DB_PASSWORD:-$(openssl rand -hex 16)}"
+          echo "::add-mask::$password"
+          kubectl create namespace lakify
+          kubectl -n lakify create secret generic lakify-db --from-literal=password="$password"
+          kubectl -n lakify create secret generic lakify-grafana --from-literal=admin-password="$(openssl rand -hex 16)"
 
-      - name: Check pod security settings
+      - name: Deploy, verify and roll back on failure
+        env:
+          API_IMAGE: ${{ steps.images.outputs.reg }}/lakify-api:${{ env.TAG }}
+          WEB_IMAGE: ${{ steps.images.outputs.reg }}/lakify-web:${{ env.TAG }}
+          EXPECTED_SHA: ${{ env.SHORT_SHA }}
+          ROLLOUT_TIMEOUT: 90s
+          RESULTS_FILE: deploy-results.json
+        run: bash .github/scripts/deploy-verify.sh
+
+      # Only a version that passed every check becomes the new rollback target.
+      - name: Tag the verified version as stable
+        env:
+          REG: ${{ steps.images.outputs.reg }}
         run: |
-          set -euo pipefail
-          pod=$(kubectl -n lakify get pod -l app.kubernetes.io/name=lakify-api -o jsonpath='{.items[0].metadata.name}')
-          test "$(kubectl -n lakify exec "$pod" -- id -u)" = "1000"
-          # The root filesystem must be mounted read-only
-          kubectl -n lakify exec "$pod" -- cat /proc/mounts | awk '$2=="/"{print $4}' | grep -q '^ro'
-          # and /tmp (the emptyDir) must still be writable
-          kubectl -n lakify exec "$pod" -- touch /tmp/ok
-          echo "Pod runs as uid 1000 with a read-only root filesystem"
-
-      - name: Smoke-test through the Kubernetes Service
-        run: |
-          set -euo pipefail
-          kubectl -n lakify port-forward svc/lakify-api 8080:80 > /tmp/port-forward.log 2>&1 &
-          pf=$!
-          for i in $(seq 1 30); do curl -fsS localhost:8080/health && break; sleep 1; done
-          echo
-
-          base=http://localhost:8080
-          curl -fsS "$base/ready" | grep -q '"status":"ready"'
-          curl -fsS "$base/version" | grep -q "\"commit\":\"${GITHUB_SHA::7}\""
-          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST "$base/api/listings" \
-            -H 'Content-Type: application/json' \
-            -d '{"title":"K8s flat","address":"Andrássy út 1","district":"VI","rent":300000,"size":50,"rooms":2,"photos":["https://example.com/k.jpg"]}')" = "201"
-          curl -fsS "$base/api/listings" | grep -q '"title":"K8s flat"'
-          kill "$pf"
-          echo "Service smoke tests passed"
-
-      - name: Self-healing - delete the pod and wait for Kubernetes to replace it
-        run: |
-          set -euo pipefail
-          old=$(kubectl -n lakify get pod -l app.kubernetes.io/name=lakify-api -o jsonpath='{.items[0].metadata.name}')
-          start=$(date +%s)
-          kubectl -n lakify delete pod "$old" --wait=false
-          for i in $(seq 1 60); do
-            new=$(kubectl -n lakify get pod -l app.kubernetes.io/name=lakify-api \
-              -o jsonpath='{range .items[?(@.status.containerStatuses[0].ready==true)]}{.metadata.name}{"\n"}{end}' | grep -v "^$old$" || true)
-            if [ -n "$new" ]; then
-              echo "Replacement pod $new ready after $(( $(date +%s) - start ))s" | tee -a "$GITHUB_STEP_SUMMARY"
-              exit 0
-            fi
-            sleep 2
+          for name in lakify-api lakify-web; do
+            docker tag "$REG/$name:$TAG" "$REG/$name:stable"
+            docker push "$REG/$name:stable"
           done
-          echo "::error::No replacement pod became ready"; exit 1
+          echo "\`$TAG\` is now the stable version" >> "$GITHUB_STEP_SUMMARY"
 
-      # maxUnavailable: 0 means the old pod is only removed once the new one
-      # passes its readiness probe.
-      - name: Rolling update
-        run: |
-          set -euo pipefail
-          start=$(date +%s)
-          kubectl -n lakify rollout restart deployment/lakify-api
-          kubectl -n lakify rollout status deployment/lakify-api --timeout=120s
-          echo "Rolling update finished in $(( $(date +%s) - start ))s" | tee -a "$GITHUB_STEP_SUMMARY"
-          kubectl -n lakify rollout history deployment/lakify-api
+      - name: Upload deployment measurements
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: deploy-results
+          path: deploy-results.json
+          if-no-files-found: ignore
 
       - name: Show Kubernetes diagnostics on failure
         if: failure()
         run: |
-          kubectl -n lakify get all -o wide || true
-          kubectl -n lakify describe deployment lakify-api || true
-          kubectl -n lakify describe pods -l app.kubernetes.io/name=lakify-api || true
-          kubectl -n lakify logs -l app.kubernetes.io/name=lakify-api --all-containers --tail=100 || true
+          kubectl -n lakify get all,pvc -o wide || true
+          kubectl -n lakify describe pods || true
+          kubectl -n lakify logs -l app.kubernetes.io/part-of=lakify --all-containers --tail=80 --prefix || true
           kubectl -n lakify get events --sort-by=.lastTimestamp || true
-
-      # ---- Publish (main only) -------------------------------------------
-
-      - name: Log in to GitHub Container Registry
-        if: env.PUBLISH == 'true'
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Push tested image to GHCR
-        if: env.PUBLISH == 'true'
-        env:
-          SHORT_SHA: ${{ steps.meta.outputs.short_sha }}
-        run: |
-          set -euo pipefail
-          # Registry paths must be lowercase.
-          repo="${REGISTRY_IMAGE,,}"
-
-          for tag in "sha-$SHORT_SHA" latest; do
-            docker tag "$IMAGE" "$repo:$tag"
-            docker push "$repo:$tag"
-          done
-
-          digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$repo:sha-$SHORT_SHA")
-          {
-            echo "### Published image"
-            echo ""
-            echo "| Tag | Reference |"
-            echo "|---|---|"
-            echo "| \`sha-$SHORT_SHA\` | \`$repo:sha-$SHORT_SHA\` |"
-            echo "| \`latest\` | \`$repo:latest\` |"
-            echo ""
-            echo "Digest: \`$digest\`"
-            echo ""
-            echo "Pull it with: \`docker pull $repo:sha-$SHORT_SHA\`"
-          } >> "$GITHUB_STEP_SUMMARY"

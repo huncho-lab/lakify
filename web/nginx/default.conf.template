@@ -1,0 +1,40 @@
+# nginx configuration for the Lakify front end.
+# The official image runs envsubst on this template at start-up, so
+# ${API_UPSTREAM} becomes the API's address (in Kubernetes: the
+# lakify-api Service). nginx's own variables ($host, $uri, ...) are left
+# alone because they are not environment variables.
+server {
+    listen 8080;
+    server_name _;
+    server_tokens off;
+
+    root /usr/share/nginx/html;
+    index lakify.html;
+
+    # Listings carry photos as data URLs; the API accepts up to 5 MB.
+    client_max_body_size 6m;
+
+    # Probe endpoint for Kubernetes and the Docker HEALTHCHECK.
+    location = /healthz {
+        access_log off;
+        default_type text/plain;
+        return 200 "ok\n";
+    }
+
+    # Everything under /api/ goes to the API, so the browser only ever
+    # talks to one address and the API is not exposed directly.
+    location /api/ {
+        proxy_pass http://${API_UPSTREAM};
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 30s;
+    }
+
+    location / {
+        try_files $uri $uri/ /lakify.html;
+        add_header X-Content-Type-Options nosniff always;
+        add_header Referrer-Policy same-origin always;
+    }
+}

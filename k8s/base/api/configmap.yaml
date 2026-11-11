@@ -1,0 +1,17 @@
+# Non-secret database settings for the API. node-postgres reads the
+# standard PG* variables directly. The password comes from the lakify-db
+# Secret, which is created by the pipeline (or by hand, see k8s/README.md)
+# and never stored in the repository.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lakify-api-config
+  labels:
+    app.kubernetes.io/name: lakify-api
+    app.kubernetes.io/component: api
+data:
+  PGHOST: lakify-db
+  PGPORT: "5432"
+  PGDATABASE: lakify
+  PGUSER: lakify
+  NODE_ENV: production

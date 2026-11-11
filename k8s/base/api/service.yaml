@@ -1,7 +1,11 @@
+# Internal only: the browser reaches the API through nginx (lakify-web).
 apiVersion: v1
 kind: Service
 metadata:
   name: lakify-api
+  labels:
+    app.kubernetes.io/name: lakify-api
+    app.kubernetes.io/component: api
 spec:
   type: ClusterIP
   selector:

@@ -1,6 +1,6 @@
 const request = require('supertest');
 const createApp = require('../src/app');
-const createListingStore = require('../src/store/listingStore');
+const createMemoryStore = require('../src/store/memoryStore');
 
 const PHOTO = 'data:image/jpeg;base64,AAAA';
 
@@ -19,7 +19,7 @@ const validListing = (overrides = {}) => ({
 // Each test gets its own app + store so tests never depend on each other.
 let app;
 beforeEach(() => {
-  app = createApp({ store: createListingStore() });
+  app = createApp({ store: createMemoryStore() });
 });
 
 const createListing = (body) => request(app).post('/api/listings').send(body);

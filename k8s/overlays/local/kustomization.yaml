@@ -1,0 +1,20 @@
+# Overlay for a long-running local cluster (Minikube or the Kubernetes
+# built into Docker Desktop), used for demonstrations and for watching the
+# Grafana dashboard under load. It runs the last version that passed the
+# pipeline (tag "stable") pulled from GitHub Container Registry.
+# See k8s/README.md for the commands.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+# Always pull, so "stable" follows the newest version that passed the pipeline.
+patches:
+  - target:
+      kind: Deployment
+      name: lakify-(api|web)
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: Always

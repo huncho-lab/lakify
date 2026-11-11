@@ -5,6 +5,7 @@ metadata:
   labels:
     # Kubernetes Pod Security Standards: refuse any pod that runs as root,
     # can escalate privileges, keeps Linux capabilities or skips seccomp.
+    # This applies to every component, including PostgreSQL and monitoring.
     pod-security.kubernetes.io/enforce: restricted
     pod-security.kubernetes.io/enforce-version: latest
     pod-security.kubernetes.io/warn: restricted

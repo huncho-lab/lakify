@@ -1,7 +1,32 @@
 // =====================================================================
-// 1. STORAGE — replace this section with Supabase later.
-//    Right now everything is saved in the browser (localStorage).
+// 1. STORAGE
+//    Listings are shared between landlords and tenants, so they live in
+//    the Lakify API (backed by PostgreSQL). Data that concerns only this
+//    user (role, saved/skipped flats, own documents) stays in the browser.
 // =====================================================================
+
+// In the cluster, nginx serves this page and forwards /api/ to the API.
+// When the page is opened with VS Code Live Server, call a locally
+// running API instead (cd api && npm run dev).
+const API = ["5500", "5501"].includes(location.port) || location.protocol === "file:"
+  ? "http://localhost:3000/api"
+  : "/api";
+
+async function api(method, path, body) {
+  const response = await fetch(API + path, {
+    method,
+    headers: body ? { "Content-Type": "application/json" } : {},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (response.status === 204) return null;
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const detail = data.details ? ": " + data.details.join(", ") : "";
+    throw new Error((data.error || `request failed (${response.status})`) + detail);
+  }
+  return data;
+}
+
 const store = {
   get(key, fallback) {
     try { return JSON.parse(localStorage.getItem("lakify." + key)) ?? fallback; }
@@ -9,7 +34,7 @@ const store = {
   },
   set(key, value) {
     try { localStorage.setItem("lakify." + key, JSON.stringify(value)); }
-    catch { toast("Browser storage is full. Delete a flat or use smaller photos."); }
+    catch { toast("Browser storage is full. Use smaller document files."); }
   }
 };
 
@@ -17,17 +42,32 @@ const store = {
 // 2. DATA
 // =====================================================================
 let role     = store.get("role", null);                        // "tenant" or "landlord"
-let listings = store.get("listings", []);                      // all flats
 let tenant   = store.get("tenant", { saved: [], skipped: [], docs: {} });
 let tab      = role === "landlord" ? "flats" : "swipe";
+let listings = [];       // summaries from GET /api/listings
+let loadError = null;    // set when the API cannot be reached
 
 const DISTRICTS = ["I","II","III","IV","V","VI","VII","VIII","IX","X","XI","XII",
                    "XIII","XIV","XV","XVI","XVII","XVIII","XIX","XX","XXI","XXII","XXIII"];
 
 function saveAll() {
   store.set("role", role);
-  store.set("listings", listings);
   store.set("tenant", tenant);
+}
+
+async function loadListings() {
+  try {
+    listings = await api("GET", "/listings");
+    loadError = null;
+  } catch (error) {
+    listings = [];
+    loadError = error.message;
+  }
+}
+
+async function refresh() {
+  await loadListings();
+  render();
 }
 
 // =====================================================================
@@ -37,6 +77,7 @@ const $ = (sel) => document.querySelector(sel);
 const screen = $("#screen");
 const forint = (n) => Number(n).toLocaleString("hu-HU") + " Ft";
 const escape = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c]));
+const photoStyle = (src) => src ? `background-image:url('${escape(src)}')` : "";
 
 function toast(message) {
   document.querySelectorAll(".toast").forEach(t => t.remove());
@@ -47,7 +88,13 @@ function toast(message) {
   setTimeout(() => t.remove(), 2500);
 }
 
-// Read a file as a data URL. Photos are shrunk so they fit in browser storage.
+function apiErrorBox() {
+  return `<div class="empty"><h2>Can't reach Lakify</h2>
+    <p class="muted">${escape(loadError)}</p>
+    <button class="btn light" id="retry">Try again</button></div>`;
+}
+
+// Read a file as a data URL. Photos are shrunk so requests stay small.
 function readFile(file) {
   return new Promise((resolve, reject) => {
     if (file.type === "application/pdf") {
@@ -87,6 +134,12 @@ function render() {
   $("#tabs").innerHTML = tabs.map(([key, label]) =>
     `<button data-tab="${key}" class="${tab === key ? "active" : ""}">${label}</button>`).join("");
 
+  if (loadError && ["swipe", "saved", "flats"].includes(tab)) {
+    screen.innerHTML = apiErrorBox();
+    $("#retry").onclick = refresh;
+    return;
+  }
+
   if (tab === "swipe") renderSwipe();
   if (tab === "saved") renderSaved();
   if (tab === "docs")  renderDocs();
@@ -96,14 +149,14 @@ function render() {
 
 $("#tabs").onclick = (e) => {
   const button = e.target.closest("[data-tab]");
-  if (button) { tab = button.dataset.tab; render(); }
+  if (button) { tab = button.dataset.tab; refresh(); }
 };
 
 $("#switchBtn").onclick = () => {
   role = role === "tenant" ? "landlord" : "tenant";
   tab = role === "tenant" ? "swipe" : "flats";
   saveAll();
-  render();
+  refresh();
 };
 
 $("#logo").onclick = () => { role = null; saveAll(); render(); };
@@ -128,7 +181,7 @@ function renderHome() {
       role = button.dataset.role;
       tab = role === "tenant" ? "swipe" : "flats";
       saveAll();
-      render();
+      refresh();
     };
   });
 }
@@ -157,14 +210,14 @@ function renderSwipe() {
   screen.innerHTML = `
     <div class="deck">
       <div class="card" id="card">
-        <div class="photo" style="background-image:url('${flat.photos[0] || ""}')">
+        <div class="photo" style="${photoStyle(flat.coverPhoto)}">
           <div class="stamp like">LIKE</div>
           <div class="stamp nope">NOPE</div>
           <div class="price">${forint(flat.rent)}/mo</div>
         </div>
         <div class="info">
           <h3>${escape(flat.title)}</h3>
-          <div class="muted">${escape(flat.address)} · District ${flat.district}</div>
+          <div class="muted">${escape(flat.address)} · District ${escape(flat.district)}</div>
           <div class="muted">${flat.size} m² · ${flat.rooms} room(s)</div>
         </div>
       </div>
@@ -216,12 +269,12 @@ function renderSaved() {
   screen.innerHTML = `<h2>Saved flats</h2>` + (saved.length
     ? saved.map(f => `
         <div class="item">
-          <div class="thumb" style="background-image:url('${f.photos[0] || ""}')"></div>
+          <div class="thumb" style="${photoStyle(f.coverPhoto)}"></div>
           <div>
             <h3>${escape(f.title)}</h3>
-            <div class="muted">${forint(f.rent)}/mo · District ${f.district} · ${f.size} m²</div>
+            <div class="muted">${forint(f.rent)}/mo · District ${escape(f.district)} · ${f.size} m²</div>
             <p class="muted">${escape(f.description)}</p>
-            <button class="btn light small" data-remove="${f.id}">Remove</button>
+            <button class="btn light small" data-remove="${escape(f.id)}">Remove</button>
           </div>
         </div>`).join("")
     : `<div class="empty"><p class="muted">Swipe right on a flat to save it here.</p></div>`);
@@ -236,7 +289,7 @@ function renderSaved() {
 }
 
 // =====================================================================
-// 8. TENANT: DOCUMENTS
+// 8. TENANT: DOCUMENTS (kept in this browser only)
 // =====================================================================
 const TENANT_DOCS = [
   ["id",     "ID card or passport"],
@@ -245,7 +298,7 @@ const TENANT_DOCS = [
 
 function renderDocs() {
   screen.innerHTML = `<h2>Your documents</h2>
-    <p class="muted">Landlords ask for these before a viewing.</p>` +
+    <p class="muted">Landlords ask for these before a viewing. They stay in this browser.</p>` +
     TENANT_DOCS.map(([key, label]) => {
       const doc = tenant.docs[key];
       return `
@@ -277,12 +330,12 @@ function renderMyFlats() {
   screen.innerHTML = `<h2>My flats</h2>` + (listings.length
     ? listings.map(f => `
         <div class="item">
-          <div class="thumb" style="background-image:url('${f.photos[0] || ""}')"></div>
+          <div class="thumb" style="${photoStyle(f.coverPhoto)}"></div>
           <div>
             <h3>${escape(f.title)}</h3>
-            <div class="muted">${forint(f.rent)}/mo · District ${f.district} · ${f.photos.length} photo(s)</div>
-            <p>${f.proof ? `<span class="badge">Proof of ownership uploaded</span>` : `<span class="badge missing">No proof of ownership</span>`}</p>
-            <button class="btn light small" data-delete="${f.id}">Delete</button>
+            <div class="muted">${forint(f.rent)}/mo · District ${escape(f.district)} · ${f.photoCount} photo(s)</div>
+            <p>${f.hasProof ? `<span class="badge">Proof of ownership uploaded</span>` : `<span class="badge missing">No proof of ownership</span>`}</p>
+            <button class="btn light small" data-delete="${escape(f.id)}">Delete</button>
           </div>
         </div>`).join("")
     : `<div class="empty"><p class="muted">You haven't listed a flat yet.</p><button class="btn yellow" id="addFirst">Add your first flat</button></div>`);
@@ -291,11 +344,12 @@ function renderMyFlats() {
   if (addFirst) addFirst.onclick = () => { tab = "add"; render(); };
 
   screen.querySelectorAll("[data-delete]").forEach(button => {
-    button.onclick = () => {
-      listings = listings.filter(f => f.id !== button.dataset.delete);
-      saveAll();
-      toast("Flat deleted");
-      render();
+    button.onclick = async () => {
+      try {
+        await api("DELETE", "/listings/" + encodeURIComponent(button.dataset.delete));
+        toast("Flat deleted");
+      } catch (error) { toast(error.message); }
+      refresh();
     };
   });
 }
@@ -310,28 +364,29 @@ function renderAddFlat() {
   screen.innerHTML = `
     <h2>Add a flat</h2>
     <form class="form" id="flatForm">
-      <label>Title <input name="title" required placeholder="Bright two-room flat near Deák tér"></label>
-      <label>Address <input name="address" required placeholder="Király utca 20"></label>
+      <label>Title <input name="title" required maxlength="120" placeholder="Bright two-room flat near Deák tér"></label>
+      <label>Address <input name="address" required maxlength="200" placeholder="Király utca 20"></label>
       <div class="row">
         <label>District
           <select name="district">${DISTRICTS.map(d => `<option>${d}</option>`).join("")}</select>
         </label>
-        <label>Rent per month (Ft) <input name="rent" type="number" required min="1" placeholder="250000"></label>
+        <label>Rent per month (Ft) <input name="rent" type="number" required min="1" step="1" placeholder="250000"></label>
       </div>
       <div class="row">
-        <label>Size (m²) <input name="size" type="number" required min="1" placeholder="45"></label>
-        <label>Rooms <input name="rooms" type="number" required min="1" value="1"></label>
+        <label>Size (m²) <input name="size" type="number" required min="1" step="any" placeholder="45"></label>
+        <label>Rooms <input name="rooms" type="number" required min="1" step="1" value="1"></label>
       </div>
-      <label>Description <textarea name="description" rows="4" placeholder="Describe the flat, the building and the neighbourhood."></textarea></label>
-      <label>Photos <input type="file" accept="image/*" multiple id="photoInput"></label>
+      <label>Description <textarea name="description" rows="4" maxlength="2000" placeholder="Describe the flat, the building and the neighbourhood."></textarea></label>
+      <label>Photos (up to 10) <input type="file" accept="image/*" multiple id="photoInput"></label>
       <div class="photos" id="photoPreview"></div>
       <label>Proof of ownership (tulajdoni lap) <input type="file" accept="image/*,application/pdf" id="proofInput"></label>
       <div class="muted" id="proofName"></div>
-      <button class="btn yellow" type="submit">Publish flat</button>
+      <button class="btn yellow" type="submit" id="publishBtn">Publish flat</button>
     </form>`;
 
   $("#photoInput").onchange = async (e) => {
     for (const file of e.target.files) {
+      if (photos.length >= 10) { toast("A flat can have at most 10 photos."); break; }
       try { photos.push(await readFile(file)); } catch (message) { toast(message); }
     }
     $("#photoPreview").innerHTML = photos.map(src => `<img src="${src}" alt="">`).join("");
@@ -346,30 +401,35 @@ function renderAddFlat() {
     } catch (message) { toast(message); }
   };
 
-  $("#flatForm").onsubmit = (e) => {
+  $("#flatForm").onsubmit = async (e) => {
     e.preventDefault();
     if (!photos.length) return toast("Add at least one photo.");
     const form = new FormData(e.target);
-    listings.unshift({
-      id: Date.now().toString(),
-      title: form.get("title"),
-      address: form.get("address"),
-      district: form.get("district"),
-      rent: Number(form.get("rent")),
-      size: Number(form.get("size")),
-      rooms: Number(form.get("rooms")),
-      description: form.get("description"),
-      photos,
-      proof,
-    });
-    saveAll();
-    toast("Flat published");
-    tab = "flats";
-    render();
+    const button = $("#publishBtn");
+    button.disabled = true;
+    try {
+      await api("POST", "/listings", {
+        title: form.get("title"),
+        address: form.get("address"),
+        district: form.get("district"),
+        rent: Number(form.get("rent")),
+        size: Number(form.get("size")),
+        rooms: Number(form.get("rooms")),
+        description: form.get("description"),
+        photos,
+        proof,
+      });
+      toast("Flat published");
+      tab = "flats";
+      refresh();
+    } catch (error) {
+      toast(error.message);
+      button.disabled = false;
+    }
   };
 }
 
 // =====================================================================
 // START
 // =====================================================================
-render();
+refresh();

@@ -1,0 +1,6 @@
+# Only the three page files and the nginx template go into the image.
+*
+!lakify.html
+!lakify.css
+!lakify.js
+!nginx/default.conf.template

@@ -1,0 +1,17 @@
+# The single entry point for users: nginx serves the page and forwards
+# /api/ to the API.
+apiVersion: v1
+kind: Service
+metadata:
+  name: lakify-web
+  labels:
+    app.kubernetes.io/name: lakify-web
+    app.kubernetes.io/component: web
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: lakify-web
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
