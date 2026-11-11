@@ -1,0 +1,165 @@
+# Continuous integration for the Lakify API.
+#
+# Every push and pull request to main runs two jobs:
+#   1. test  - lint, unit/integration tests and the 80 % coverage gate
+#   2. build - build the Docker image, start it, wait for the HEALTHCHECK
+#              and smoke-test the live endpoints
+# The build job only runs when tests pass, so a broken commit never
+# produces an image.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'api/**'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'api/**'
+      - '.github/workflows/ci.yml'
+  workflow_dispatch: # allows a manual run from the Actions tab
+
+# A newer push to the same branch cancels the run that is still going.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: the workflow only needs to read the repository.
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: api
+
+jobs:
+  test:
+    name: Lint and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: api/.nvmrc
+          cache: npm
+          cache-dependency-path: api/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npx eslint . --max-warnings 0
+
+      - name: Test with coverage gate (80 %)
+        run: npm run test:coverage -- --ci
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: api/coverage/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  build:
+    name: Build and smoke-test image
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      IMAGE: lakify-api:ci-${{ github.sha }}
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Read version from package.json
+        id: meta
+        run: |
+          echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: api
+          load: true # keep the image in the runner's Docker so it can be run
+          push: false # pushing to a registry is the next pipeline step
+          tags: ${{ env.IMAGE }}
+          build-args: |
+            APP_VERSION=${{ steps.meta.outputs.version }}
+            GIT_SHA=${{ steps.meta.outputs.short_sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Report image size
+        run: |
+          docker image ls "$IMAGE" --format 'Image size: {{.Size}}' | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Start container
+        run: docker run -d --name lakify -p 3000:3000 "$IMAGE"
+
+      - name: Wait for HEALTHCHECK to report healthy
+        run: |
+          for i in $(seq 1 30); do
+            status=$(docker inspect --format '{{.State.Health.Status}}' lakify)
+            echo "Attempt $i: $status"
+            if [ "$status" = "healthy" ]; then exit 0; fi
+            if [ "$status" = "unhealthy" ]; then break; fi
+            sleep 2
+          done
+          echo "::error::Container did not become healthy"
+          docker logs lakify
+          exit 1
+
+      - name: Smoke-test endpoints
+        env:
+          EXPECTED_VERSION: ${{ steps.meta.outputs.version }}
+          EXPECTED_SHA: ${{ steps.meta.outputs.short_sha }}
+        run: |
+          set -euo pipefail
+          base=http://localhost:3000
+
+          curl -fsS "$base/health" | grep -q '"status":"ok"'
+          curl -fsS "$base/ready"  | grep -q '"status":"ready"'
+
+          version=$(curl -fsS "$base/version")
+          echo "/version -> $version"
+          echo "$version" | grep -q "\"version\":\"$EXPECTED_VERSION\""
+          echo "$version" | grep -q "\"commit\":\"$EXPECTED_SHA\""
+
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "$base/api/listings" \
+            -H 'Content-Type: application/json' \
+            -d '{"title":"CI flat","address":"Király utca 20","district":"VI","rent":250000,"size":45,"rooms":2,"photos":["https://example.com/a.jpg"]}')
+          test "$code" = "201"
+
+          curl -fsS "$base/api/listings" | grep -q '"title":"CI flat"'
+          test "$(curl -s -o /dev/null -w '%{http_code}' "$base/api/listings?district=XXX")" = "400"
+
+          echo "All smoke tests passed"
+
+      - name: Check the container runs as a non-root user
+        run: test "$(docker exec lakify id -u)" != "0"
+
+      - name: Check graceful shutdown
+        run: |
+          docker stop --time 10 lakify
+          test "$(docker inspect --format '{{.State.ExitCode}}' lakify)" = "0"
+          docker logs lakify 2>&1 | grep -q "SIGTERM received"
+
+      - name: Show container logs on failure
+        if: failure()
+        run: docker logs lakify || true
