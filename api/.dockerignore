@@ -1,0 +1,28 @@
+# Keep the build context small and leak-free: only package*.json and src/
+# are copied into the image.
+
+# Dependencies are installed inside the image
+node_modules
+npm-debug.log*
+*.log
+
+# Tests, coverage and dev tooling are not shipped
+tests
+coverage
+eslint.config.js
+.nvmrc
+
+# Docs, VCS and editor files
+README.md
+.git
+.gitignore
+.vscode
+.idea
+
+# Secrets and local env
+.env
+.env.*
+
+# Docker files themselves
+Dockerfile
+.dockerignore
