@@ -1,4 +1,4 @@
-# Continuous integration for the Lakify API.
+# CI pipeline for the Lakify API.
 #
 # Every push and pull request to main runs two jobs:
 #   1. test  - lint, unit/integration tests and the 80 % coverage gate
@@ -6,6 +6,13 @@
 #              and smoke-test the live endpoints
 # The build job only runs when tests pass, so a broken commit never
 # produces an image.
+#
+# On pushes to main (not pull requests), the image that passed the smoke
+# tests is then pushed to GitHub Container Registry as
+#   ghcr.io/<owner>/lakify-api:sha-<commit>  (immutable, one per commit)
+#   ghcr.io/<owner>/lakify-api:latest        (moves to the newest main build)
+# Pushing the tested image itself, rather than rebuilding, guarantees the
+# registry holds exactly what was tested.
 
 name: CI
 
@@ -43,10 +50,10 @@ jobs:
 
     steps:
       - name: Check out code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version-file: api/.nvmrc
           cache: npm
@@ -63,7 +70,7 @@ jobs:
 
       - name: Upload coverage report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-report
           path: api/coverage/
@@ -76,12 +83,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
+    # packages: write lets this job push to GHCR with the built-in token.
+    # Pull requests never reach the push steps (see PUBLISH below).
+    permissions:
+      contents: read
+      packages: write
+
     env:
       IMAGE: lakify-api:ci-${{ github.sha }}
+      REGISTRY_IMAGE: ghcr.io/${{ github.repository_owner }}/lakify-api
+      PUBLISH: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
 
     steps:
       - name: Check out code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Read version from package.json
         id: meta
@@ -90,15 +105,18 @@ jobs:
           echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Build image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: api
           load: true # keep the image in the runner's Docker so it can be run
-          push: false # pushing to a registry is the next pipeline step
+          push: false # the tested image is pushed by a later step on main
           tags: ${{ env.IMAGE }}
+          # Links the GHCR package to this repository.
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
           build-args: |
             APP_VERSION=${{ steps.meta.outputs.version }}
             GIT_SHA=${{ steps.meta.outputs.short_sha }}
@@ -163,3 +181,41 @@ jobs:
       - name: Show container logs on failure
         if: failure()
         run: docker logs lakify || true
+
+      # ---- Publish (main only) -------------------------------------------
+
+      - name: Log in to GitHub Container Registry
+        if: env.PUBLISH == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push tested image to GHCR
+        if: env.PUBLISH == 'true'
+        env:
+          SHORT_SHA: ${{ steps.meta.outputs.short_sha }}
+        run: |
+          set -euo pipefail
+          # Registry paths must be lowercase.
+          repo="${REGISTRY_IMAGE,,}"
+
+          for tag in "sha-$SHORT_SHA" latest; do
+            docker tag "$IMAGE" "$repo:$tag"
+            docker push "$repo:$tag"
+          done
+
+          digest=$(docker image inspect --format '{{index .RepoDigests 0}}' "$repo:sha-$SHORT_SHA")
+          {
+            echo "### Published image"
+            echo ""
+            echo "| Tag | Reference |"
+            echo "|---|---|"
+            echo "| \`sha-$SHORT_SHA\` | \`$repo:sha-$SHORT_SHA\` |"
+            echo "| \`latest\` | \`$repo:latest\` |"
+            echo ""
+            echo "Digest: \`$digest\`"
+            echo ""
+            echo "Pull it with: \`docker pull $repo:sha-$SHORT_SHA\`"
+          } >> "$GITHUB_STEP_SUMMARY"
