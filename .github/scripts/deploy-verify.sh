@@ -202,8 +202,9 @@ if [ "$PHASE" != candidate ]; then
 group "Deploy baseline (stable) with database and monitoring"
 kubectl apply -k k8s/overlays/kind
 rollout statefulset/lakify-db 180s
-rollout deployment/lakify-api 180s
-rollout deployment/lakify-web 180s
+# A first deployment waits for the database and can take longer than the
+# progress deadline, which is meant for updates; wait for availability instead.
+k wait --for=condition=Available deployment/lakify-api deployment/lakify-web --timeout=180s
 endgroup
 
 group "Verify baseline"
