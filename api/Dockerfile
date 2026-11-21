@@ -53,4 +53,4 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
 
 # Run node directly (not via npm) so SIGTERM from Kubernetes reaches the
 # graceful shutdown handler in server.js.
-CMD ["node", "src/sever.js"]
+CMD ["node", "src/server.js"]
