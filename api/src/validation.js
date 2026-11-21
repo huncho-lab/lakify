@@ -32,7 +32,7 @@ const FIELDS = {
   },
   rent: {
     required: true,
-    check: (v) => (Number.isInteger(v) && v > 0 ? null : 'rent must be a positive whole number (Ft per month)'),
+    check: (v) => (Number.isInteger(v) && v >= 0 ? null : 'rent must be a positive whole number (Ft per month)'),
   },
   size: {
     required: true,
