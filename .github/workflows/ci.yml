@@ -4,10 +4,12 @@
 #              the API. A failure stops the pipeline before any image is built.
 #   2. build   main only: build the API and front-end images, check them in
 #              Docker, and publish them to GHCR tagged with the commit.
-#   3. deploy  main only: create a Kind cluster, deploy the last known-good
-#              version ("stable") with PostgreSQL, Prometheus and Grafana, roll
-#              out the new version, verify it, roll back automatically if it
-#              fails, and tag it as the new "stable" if it passes.
+#   3. deploy  main only, in parallel with job 2: create a Kind cluster and
+#              deploy the last known-good version ("stable") with PostgreSQL,
+#              Prometheus and Grafana; once job 2 has published the new
+#              images, roll out the new version under load, verify it, roll
+#              back automatically if it fails, and tag it as the new "stable"
+#              if it passes.
 #
 # Pull requests run only job 1, so they are tested but never deployed.
 # A manual run (Actions -> CI -> Run workflow) can inject a fault into the new
@@ -235,21 +237,34 @@ jobs:
   # ---------------------------------------------------------------------------
   deploy:
     name: 3. Deploy, verify and roll back
-    needs: build
+    # Starts as soon as the tests have passed, in parallel with job 2: the
+    # cluster and the last known-good version (stable) do not depend on the
+    # new images, so they are prepared while the images are being built. The
+    # new version only reaches the cluster after job 2 has checked and
+    # published it; if job 2 fails, nothing new is deployed.
+    needs: ci
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     permissions:
       contents: read
       packages: write # pull the images and move the "stable" tag
+      actions: read # follow the status of job 2
 
     env:
-      TAG: ${{ needs.build.outputs.tag }}
-      SHORT_SHA: ${{ needs.build.outputs.short_sha }}
       FAULT_MODE: ${{ github.event.inputs.fault || 'none' }}
 
     steps:
       - name: Check out code
         uses: actions/checkout@v7
+
+      - name: Work out the new version's tag
+        id: meta
+        run: |
+          echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "TAG=sha-${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          echo "SHORT_SHA=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          echo "reg=${REGISTRY,,}" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v4
@@ -258,24 +273,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Pull the new version and the last stable version
-        id: images
+      - name: Pull the last stable version
+        id: stable
+        env:
+          REG: ${{ steps.meta.outputs.reg }}
         run: |
-          reg="${REGISTRY,,}"
-          echo "reg=$reg" >> "$GITHUB_OUTPUT"
-          for name in lakify-api lakify-web; do
-            docker pull "$reg/$name:$TAG"
-          done
-          # On the very first run there is no stable version yet; the new
-          # version then also serves as the baseline it is rolled out over.
-          if docker pull "$reg/lakify-api:stable" && docker pull "$reg/lakify-web:stable"; then
+          if docker pull "$REG/lakify-api:stable" && docker pull "$REG/lakify-web:stable"; then
             echo "first_run=false" >> "$GITHUB_OUTPUT"
           else
-            echo "::notice::No stable version yet (first deployment); using the new version as the baseline"
+            # Very first deployment: the new version will also be the baseline.
+            echo "::notice::No stable version yet (first deployment); the new version will be the baseline"
             echo "first_run=true" >> "$GITHUB_OUTPUT"
-            for name in lakify-api lakify-web; do
-              docker tag "$reg/$name:$TAG" "$reg/$name:stable"
-            done
           fi
 
       - name: Create Kind cluster
@@ -283,14 +291,6 @@ jobs:
         with:
           cluster_name: lakify
           wait: 120s
-
-      - name: Load images into the cluster
-        env:
-          REG: ${{ steps.images.outputs.reg }}
-        run: |
-          kind load docker-image --name lakify \
-            "$REG/lakify-api:$TAG" "$REG/lakify-web:$TAG" \
-            "$REG/lakify-api:stable" "$REG/lakify-web:stable"
 
       # NFR6: the database password is a GitHub Actions secret (DB_PASSWORD),
       # passed to the cluster as a Kubernetes Secret. If the secret is not
@@ -305,19 +305,80 @@ jobs:
           kubectl -n lakify create secret generic lakify-db --from-literal=password="$password"
           kubectl -n lakify create secret generic lakify-grafana --from-literal=admin-password="$(openssl rand -hex 16)"
 
-      - name: Deploy, verify and roll back on failure
+      - name: Deploy the stable version (baseline) while the new images are built
+        if: steps.stable.outputs.first_run == 'false'
         env:
-          API_IMAGE: ${{ steps.images.outputs.reg }}/lakify-api:${{ env.TAG }}
-          WEB_IMAGE: ${{ steps.images.outputs.reg }}/lakify-web:${{ env.TAG }}
+          REG: ${{ steps.meta.outputs.reg }}
+          API_IMAGE: ${{ steps.meta.outputs.reg }}/lakify-api:${{ env.TAG }}
+          WEB_IMAGE: ${{ steps.meta.outputs.reg }}/lakify-web:${{ env.TAG }}
+          EXPECTED_SHA: ${{ env.SHORT_SHA }}
+          RESULTS_FILE: deploy-results.json
+          PHASE: baseline
+        run: |
+          kind load docker-image --name lakify "$REG/lakify-api:stable" "$REG/lakify-web:stable"
+          bash .github/scripts/deploy-verify.sh
+
+      # Gate: wait for job 2 of this run. Only images that passed its checks
+      # and were published are deployed.
+      - name: Wait for job 2 to publish the new images
+        id: build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          started=$(date +%s)
+          for _ in $(seq 1 180); do
+            read -r status conclusion <<< "$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs" \
+              --jq '.jobs[] | select(.name == "2. Build and publish images") | "\(.status) \(.conclusion // "none")"')"
+            if [ "$status" = completed ]; then
+              echo "Job 2 finished ($conclusion); waited $(( $(date +%s) - started )) s"
+              echo "waited_s=$(( $(date +%s) - started ))" >> "$GITHUB_OUTPUT"
+              [ "$conclusion" = success ] && { echo "ok=true" >> "$GITHUB_OUTPUT"; exit 0; }
+              echo "::warning::Job 2 did not publish the images ($conclusion); nothing new is deployed"
+              echo "ok=false" >> "$GITHUB_OUTPUT"; exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Job 2 did not finish within 15 minutes"; exit 1
+
+      - name: Pull the new version and load it into the cluster
+        if: steps.build.outputs.ok == 'true'
+        env:
+          REG: ${{ steps.meta.outputs.reg }}
+          FIRST_RUN: ${{ steps.stable.outputs.first_run }}
+        run: |
+          for name in lakify-api lakify-web; do
+            docker pull "$REG/$name:$TAG"
+            [ "$FIRST_RUN" = true ] && docker tag "$REG/$name:$TAG" "$REG/$name:stable"
+          done
+          images=("$REG/lakify-api:$TAG" "$REG/lakify-web:$TAG")
+          [ "$FIRST_RUN" = true ] && images+=("$REG/lakify-api:stable" "$REG/lakify-web:stable")
+          kind load docker-image --name lakify "${images[@]}"
+
+      - name: Deploy the baseline (first deployment only)
+        if: steps.build.outputs.ok == 'true' && steps.stable.outputs.first_run == 'true'
+        env:
+          API_IMAGE: ${{ steps.meta.outputs.reg }}/lakify-api:${{ env.TAG }}
+          WEB_IMAGE: ${{ steps.meta.outputs.reg }}/lakify-web:${{ env.TAG }}
+          EXPECTED_SHA: ${{ env.SHORT_SHA }}
+          PHASE: baseline
+        run: bash .github/scripts/deploy-verify.sh
+
+      - name: Roll out the new version, verify and roll back on failure
+        if: steps.build.outputs.ok == 'true'
+        env:
+          API_IMAGE: ${{ steps.meta.outputs.reg }}/lakify-api:${{ env.TAG }}
+          WEB_IMAGE: ${{ steps.meta.outputs.reg }}/lakify-web:${{ env.TAG }}
           EXPECTED_SHA: ${{ env.SHORT_SHA }}
           ROLLOUT_TIMEOUT: 90s
           RESULTS_FILE: deploy-results.json
+          PHASE: candidate
         run: bash .github/scripts/deploy-verify.sh
 
       # Only a version that passed every check becomes the new rollback target.
       - name: Tag the verified version as stable
+        if: steps.build.outputs.ok == 'true'
         env:
-          REG: ${{ steps.images.outputs.reg }}
+          REG: ${{ steps.meta.outputs.reg }}
         run: |
           for name in lakify-api lakify-web; do
             docker tag "$REG/$name:$TAG" "$REG/$name:stable"
