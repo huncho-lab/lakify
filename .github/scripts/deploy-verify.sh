@@ -10,6 +10,15 @@
 #      the previous version again and record the time to recover (MTTR).
 #   5. If it passes, test self-healing, data persistence and monitoring.
 #
+# While the new version is rolled out (and rolled back, if needed), a load
+# generator inside the cluster sends a request to the front end every 100 ms
+# through the Kubernetes Services, the way users would, and every failed
+# request is counted (zero downtime, NFR2).
+#
+# PHASE=baseline runs only step 1, PHASE=candidate only steps 2-5 (the
+# pipeline deploys the baseline while the new images are still being built);
+# the default runs everything.
+#
 # Every measured time is written to $RESULTS_FILE (JSON) for the evaluation.
 #
 # Required environment:
@@ -19,6 +28,8 @@
 #   FAULT_MODE             none | unready | error  (failure experiments only)
 #   ROLLOUT_TIMEOUT        how long a rollout may take (default 90s)
 #   RESULTS_FILE           where to write the JSON results
+#   PHASE                  all | baseline | candidate (default all)
+#   LOAD_TEST              true | false (default true)
 #
 # Exit codes: 0 deployed, 1 failed and rolled back, 2 rollback failed.
 
@@ -28,6 +39,8 @@ NS=lakify
 FAULT_MODE="${FAULT_MODE:-none}"
 ROLLOUT_TIMEOUT="${ROLLOUT_TIMEOUT:-90s}"
 RESULTS_FILE="${RESULTS_FILE:-deploy-results.json}"
+PHASE="${PHASE:-all}"
+LOAD_TEST="${LOAD_TEST:-true}"
 SUMMARY="${GITHUB_STEP_SUMMARY:-/dev/null}"
 : "${API_IMAGE:?}" "${WEB_IMAGE:?}" "${EXPECTED_SHA:?}"
 
@@ -49,7 +62,8 @@ write_results() {
 
 PF_PID=""
 stop_forward() { if [ -n "$PF_PID" ]; then kill "$PF_PID" 2>/dev/null || true; wait "$PF_PID" 2>/dev/null || true; PF_PID=""; fi; }
-trap stop_forward EXIT
+cleanup() { stop_forward; [ "$PHASE" = baseline ] || k delete pod loadgen --ignore-not-found --wait=false >/dev/null 2>&1 || true; }
+trap cleanup EXIT
 
 # forward <service> <service port> <local port> <readiness path>
 forward() {
@@ -117,8 +131,74 @@ wait_ready() {
   return 1
 }
 
+# --- load generator (zero-downtime measurement) ---------------------------
+# A pod running the stable API image (already in the cluster, non-root, so it
+# is admitted by the restricted Pod Security Standard) requests the listings
+# through the front-end Service every 100 ms and logs "<epoch ms> <status>",
+# where status 0 means the request failed without an HTTP answer (timeout or
+# refused connection).
+LOAD_SCRIPT='const u="http://lakify-web/api/listings";setInterval(async()=>{const t=Date.now();let c=0;try{const r=await fetch(u,{signal:AbortSignal.timeout(2000)});c=r.status;await r.arrayBuffer()}catch(e){}console.log(t+" "+c)},100)'
+
+start_load() {
+  local image="${API_IMAGE%:*}:stable"
+  k apply -f - <<YAML
+apiVersion: v1
+kind: Pod
+metadata:
+  name: loadgen
+  labels: {app.kubernetes.io/name: loadgen}
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    seccompProfile: {type: RuntimeDefault}
+  containers:
+    - name: loadgen
+      image: $image
+      imagePullPolicy: IfNotPresent
+      command: ["node", "-e", $(printf '%s' "$LOAD_SCRIPT" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')]
+      resources: {requests: {cpu: 20m, memory: 32Mi}, limits: {cpu: 200m, memory: 96Mi}}
+      securityContext:
+        allowPrivilegeEscalation: false
+        readOnlyRootFilesystem: true
+        capabilities: {drop: [ALL]}
+YAML
+  k wait --for=condition=Ready pod/loadgen --timeout=60s
+  # start measuring only once the baseline answers the load generator
+  for _ in $(seq 1 30); do
+    [ "$(k logs loadgen 2>/dev/null | awk '$2 == 200' | wc -l)" -ge 10 ] && return 0
+    sleep 1
+  done
+  echo "load generator did not get answers from the baseline"; k logs loadgen | tail -5
+  return 1
+}
+
+# load_count <from s> <to s>: "<requests> <failed>" logged in [from, to)
+load_count() {
+  awk -v a="$1" -v b="$2" '{ t = $1 / 1000 } t >= a && t < b { n++; if ($2 != 200) f++ } END { printf "%d %d", n, f }' /tmp/loadgen.log
+}
+
+stop_load() {
+  k logs loadgen > /tmp/loadgen.log 2>/dev/null || true
+  k delete pod loadgen --wait=false >/dev/null 2>&1 || true
+  echo "load generator: $(wc -l < /tmp/loadgen.log) requests logged, non-200 answers by status:"
+  awk '$2 != 200 { c[$2]++ } END { for (s in c) print "  status " s ": " c[s] }' /tmp/loadgen.log
+}
+
+# record_load <key prefix> <from s> <to s>
+record_load() {
+  local n f
+  read -r n f <<< "$(load_count "$2" "$3")"
+  R[${1}_requests]=$n
+  R[${1}_failed]=$f
+  echo "Load $1: $f of $n requests failed"
+}
+
 # --- 1. baseline: the last known-good version -----------------------------
 
+if [ "$PHASE" != candidate ]; then
 group "Deploy baseline (stable) with database and monitoring"
 kubectl apply -k k8s/overlays/kind
 rollout statefulset/lakify-db 180s
@@ -132,8 +212,16 @@ if ! smoke_test baseline; then
   R[outcome]='"baseline_failed"'; write_results; exit 2
 fi
 endgroup
+fi
+[ "$PHASE" = baseline ] && { echo "Baseline deployed and verified"; exit 0; }
 
 # --- 2. roll out the new version -----------------------------------------
+
+if [ "$LOAD_TEST" = true ]; then
+  group "Start the load generator"
+  start_load || { echo "::error::Load generator could not reach the baseline"; R[outcome]='"baseline_failed"'; write_results; exit 2; }
+  endgroup
+fi
 
 group "Roll out $API_IMAGE and $WEB_IMAGE (fault: $FAULT_MODE)"
 t_start=$(now)
@@ -183,6 +271,12 @@ if [ -n "$failure" ]; then
 
   R[failure]="\"$failure\""
   R[time_to_detect_s]=$(secs "$t_start" "$t_detect")
+  if [ "$LOAD_TEST" = true ]; then
+    t_end=$(now)
+    stop_load
+    record_load load_before_detect "$t_start" "$t_detect"
+    record_load load_during_rollback "$t_detect" "$t_end"
+  fi
   if $rollback_ok; then
     R[outcome]='"rolled_back"'
     R[time_to_recover_s]=$(secs "$t_detect" "$t_recovered")
@@ -195,6 +289,7 @@ if [ -n "$failure" ]; then
       echo "| Detected by | $failure |"
       echo "| Time to detect | ${R[time_to_detect_s]} s |"
       echo "| Time to recover (rollback verified) | ${R[time_to_recover_s]} s |"
+      [ "$LOAD_TEST" = true ] && echo "| Failed user requests before detection / during rollback | ${R[load_before_detect_failed]} of ${R[load_before_detect_requests]} / ${R[load_during_rollback_failed]} of ${R[load_during_rollback_requests]} |"
     } >> "$SUMMARY"
     k rollout history deployment/lakify-api
     write_results; exit 1
@@ -206,6 +301,10 @@ fi
 
 R[outcome]='"deployed"'
 R[time_to_deploy_s]=$(secs "$t_start" "$t_verified")
+if [ "$LOAD_TEST" = true ]; then
+  stop_load
+  record_load load_rollout "$t_start" "$t_verified"
+fi
 echo "New version deployed and verified in ${R[time_to_deploy_s]} s"
 
 # --- 4. resilience: self-healing and data persistence ---------------------
@@ -274,6 +373,7 @@ endgroup
   echo "| Check | Result |"
   echo "|---|---|"
   echo "| Rolling update to \`$EXPECTED_SHA\` verified | ${R[time_to_deploy_s]} s |"
+  [ "$LOAD_TEST" = true ] && echo "| Failed user requests during the rollout | ${R[load_rollout_failed]} of ${R[load_rollout_requests]} |"
   echo "| API pod deleted, back to 2 ready replicas | ${R[self_heal_api_s]} s |"
   echo "| Database pod restarted, $after listings kept | ${R[db_recovery_s]} s |"
   echo "| Prometheus API targets up | $up |"

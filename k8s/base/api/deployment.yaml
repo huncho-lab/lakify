@@ -12,7 +12,7 @@ spec:
   revisionHistoryLimit: 5
   # If a new version is not ready within this time, Kubernetes marks the
   # rollout as failed (the pipeline then rolls back).
-  progressDeadlineSeconds: 60
+  progressDeadlineSeconds: 30
   selector:
     matchLabels:
       app.kubernetes.io/name: lakify-api
