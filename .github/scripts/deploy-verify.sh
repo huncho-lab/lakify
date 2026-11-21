@@ -332,7 +332,17 @@ k wait --for=condition=Ready pod/lakify-db-0 --timeout=180s
 after=$(k exec statefulset/lakify-db -- psql -U lakify -d lakify -tAc 'SELECT count(*) FROM listings')
 # The API pods report not-ready while the database is down; wait for both.
 wait_ready lakify-api 2 60 || { echo "::error::API did not become ready again after the database restart"; write_results; exit 2; }
+# Recovered means users can write again: the API may still hold connections
+# to the old database pod, so retry the full smoke test until it passes.
+attempts=0
+until smoke_test after-db-restart > /tmp/smoke-db.log 2>&1; do
+  attempts=$((attempts + 1))
+  tail -1 /tmp/smoke-db.log
+  [ "$attempts" -ge 30 ] && { echo "::error::Writes still fail 30 attempts after the database restart"; write_results; exit 2; }
+  sleep 1
+done
 R[db_recovery_s]=$(secs "$t0" "$(now)")
+R[db_recovery_failed_attempts]=$attempts
 echo "Listings before restart: $before, after: $after (database back in ${R[db_recovery_s]} s)"
 [ "$before" = "$after" ] || { echo "::error::Data was lost when the database pod restarted"; write_results; exit 2; }
 R[persisted_listings]=$after
