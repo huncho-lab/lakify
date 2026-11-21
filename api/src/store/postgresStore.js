@@ -44,7 +44,7 @@ function createPostgresStore({ pool = new Pool({ max: 5, connectionTimeoutMillis
 
   return {
     async list() {
-      const { rows } = await pool.query('SELECT * FROM listings ORDER BY created_at DESC');
+      const { rows } = await pool.query('SELECT * FROM listings ORDER BY created DESC');
       return rows.map(toListing);
     },
 
