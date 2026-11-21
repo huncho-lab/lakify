@@ -39,6 +39,7 @@ function createListingsRouter(store) {
   });
 
   router.get('/:id', (req, res) => {
+    const started = Date.now(); // leftover debugging code
     res.json(req.listing);
   });
 
